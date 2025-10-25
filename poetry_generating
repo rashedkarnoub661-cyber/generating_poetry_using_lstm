@@ -1,0 +1,416 @@
+import os
+import math
+import json
+import random
+import re
+from typing import List, Dict
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
+
+class Config:
+    data_path = os.environ.get("POETRY_DATA", "poetry_corpus.txt")
+    use_char_level = True
+    min_word_freq = 2
+    max_seq_len = 256
+    test_size = 0.1
+    val_size = 0.1
+    seed = 42
+    batch_size = 32
+    lr = 3e-4
+    epochs = 10
+    grad_clip = 1.0
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_workers = 0
+    lstm_embed_dim = 256
+    lstm_hidden_dim = 512
+    lstm_layers = 2
+    lstm_dropout = 0.2
+    tf_embed_dim = 256
+    tf_ff_dim = 512
+    tf_heads = 8
+    tf_layers = 6
+    tf_dropout = 0.2
+    temperature = 0.9
+    top_k = 20
+    gen_max_len = 200
+    out_dir = "artifacts"
+    lstm_ckpt = "best_lstm.pt"
+    tf_ckpt = "best_transformer.pt"
+    log_file = "training_log.json"
+
+cfg = Config()
+os.makedirs(cfg.out_dir, exist_ok=True)
+
+def normalize_text(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"[^\S\r\n]+", " ", s)
+    s = s.replace("ى", "ي").replace("ئ", "ي").replace("ؤ", "و")
+    s = re.sub(r"[^\u0600-\u06FFa-zA-Z0-9\s\.\,\;\:\!\?\-\(\)\'\"]", "", s)
+    s = s.lower()
+    return s
+
+def split_poems(raw_text: str) -> List[str]:
+    parts = re.split(r"\n\s*\n", raw_text)
+    poems = [normalize_text(p) for p in parts if len(p.strip()) > 0]
+    return poems
+
+class Vocab:
+    def __init__(self, tokens: List[str]):
+        uniq = sorted(set(tokens))
+        self.itos = ["<pad>", "<bos>", "<eos>", "<unk>"] + uniq
+        self.stoi = {t: i for i, t in enumerate(self.itos)}
+    def __len__(self):
+        return len(self.itos)
+    def encode_tokens(self, tokens: List[str]) -> List[int]:
+        return [self.stoi.get(t, self.stoi["<unk>"]) for t in tokens]
+    def decode_tokens(self, ids: List[int]) -> List[str]:
+        return [self.itos[i] for i in ids]
+
+def build_vocab(poems: List[str], char_level=True, min_word_freq=2) -> Vocab:
+    if char_level:
+        corpus = "".join(poems)
+        tokens = list(corpus)
+    else:
+        words = []
+        for p in poems:
+            words.extend(p.split())
+        freq = {}
+        for w in words:
+            freq[w] = freq.get(w, 0) + 1
+        tokens = [w for w, c in freq.items() if c >= min_word_freq]
+    return Vocab(tokens)
+
+def poem_to_sequence(poem: str, vocab: Vocab, char_level=True) -> List[int]:
+    if char_level:
+        tokens = list(poem)
+    else:
+        tokens = poem.split()
+    seq = [vocab.stoi["<bos>"]] + vocab.encode_tokens(tokens) + [vocab.stoi["<eos>"]]
+    return seq
+
+class PoetryDataset(Dataset):
+    def __init__(self, sequences: List[List[int]], max_len: int):
+        self.data = []
+        for seq in sequences:
+            for i in range(0, len(seq) - 1, max_len):
+                chunk = seq[i:i+max_len]
+                if len(chunk) < 2:
+                    continue
+                self.data.append(chunk)
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        seq = self.data[idx]
+        x = torch.tensor(seq[:-1], dtype=torch.long)
+        y = torch.tensor(seq[1:], dtype=torch.long)
+        return x, y
+
+def collate_batch(batch, pad_idx=0):
+    xs, ys = zip(*batch)
+    max_len = max(x.size(0) for x in xs)
+    x_padded = torch.full((len(xs), max_len), pad_idx, dtype=torch.long)
+    y_padded = torch.full((len(xs), max_len), pad_idx, dtype=torch.long)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        x_padded[i, :x.size(0)] = x
+        y_padded[i, :y.size(0)] = y
+    return x_padded, y_padded
+
+class LSTMGenerator(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, layers, dropout):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=layers, dropout=dropout, batch_first=True)
+        self.drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(hidden_dim, vocab_size)
+    def forward(self, x):
+        emb = self.embed(x)
+        out, _ = self.lstm(emb)
+        out = self.drop(out)
+        logits = self.proj(out)
+        return logits
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=10000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    def forward(self, x):
+        T = x.size(1)
+        return x + self.pe[:, :T, :]
+
+class TransformerGenerator(nn.Module):
+    def __init__(self, vocab_size, embed_dim, ff_dim, heads, layers, dropout):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.pos = PositionalEncoding(embed_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=heads, dim_feedforward=ff_dim, dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        self.drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(embed_dim, vocab_size)
+    def forward(self, x, src_mask=None, src_key_padding_mask=None):
+        emb = self.embed(x)
+        emb = self.pos(emb)
+        out = self.encoder(emb, mask=src_mask, src_key_padding_mask=src_key_padding_mask)
+        out = self.drop(out)
+        logits = self.proj(out)
+        return logits
+
+def compute_loss(logits, targets, pad_idx=0):
+    vocab_size = logits.size(-1)
+    loss = F.cross_entropy(logits.view(-1, vocab_size), targets.view(-1), ignore_index=pad_idx)
+    return loss
+
+def perplexity(loss):
+    return float(torch.exp(loss.detach()).item())
+
+def train_one_epoch(model, loader, opt, pad_idx=0, grad_clip=1.0, device="cpu"):
+    model.train()
+    total_loss = 0.0
+    for x, y in tqdm(loader, desc="Train", leave=False):
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad()
+        logits = model(x)
+        loss = compute_loss(logits, y, pad_idx=pad_idx)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        opt.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+@torch.no_grad()
+def evaluate(model, loader, pad_idx=0, device="cpu"):
+    model.eval()
+    total_loss = 0.0
+    for x, y in tqdm(loader, desc="Val", leave=False):
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        loss = compute_loss(logits, y, pad_idx=pad_idx)
+        total_loss += loss.item()
+    avg = total_loss / len(loader)
+    return avg, perplexity(torch.tensor(avg))
+
+@torch.no_grad()
+def sample_next_token(logits, temperature=1.0, top_k=0):
+    logits = logits / max(temperature, 1e-6)
+    probs = F.softmax(logits, dim=-1)
+    if top_k > 0:
+        top_vals, top_idx = torch.topk(probs, top_k)
+        mask = torch.zeros_like(probs)
+        mask.scatter_(0, top_idx, 1.0)
+        probs = probs / probs.sum()
+    token_id = torch.multinomial(probs, num_samples=1).item()
+    return token_id
+
+@torch.no_grad()
+def generate_text(model, vocab: Vocab, prompt: str, max_len=200, temperature=0.9, top_k=20, device="cpu", char_level=True):
+    model.eval()
+    if char_level:
+        tokens = list(normalize_text(prompt))
+    else:
+        tokens = normalize_text(prompt).split()
+    seq = [vocab.stoi["<bos>"]] + vocab.encode_tokens(tokens)
+    x = torch.tensor(seq, dtype=torch.long).unsqueeze(0).to(device)
+    output_ids = seq.copy()
+    for _ in range(max_len):
+        logits = model(x)
+        next_logit = logits[0, -1]
+        next_id = sample_next_token(next_logit, temperature=temperature, top_k=top_k)
+        output_ids.append(next_id)
+        if next_id == vocab.stoi["<eos>"]:
+            break
+        x = torch.tensor(output_ids, dtype=torch.long).unsqueeze(0).to(device)
+    tokens_out = vocab.decode_tokens(output_ids[1:])
+    text = "".join(tokens_out) if char_level else " ".join(tokens_out)
+    if "<eos>" in tokens_out:
+        idx = tokens_out.index("<eos>")
+        tokens_out = tokens_out[:idx]
+        text = "".join(tokens_out) if char_level else " ".join(tokens_out)
+    return text.strip()
+
+def coherence_score(text: str) -> float:
+    words = text.split()
+    if len(words) == 0:
+        return 0.0
+    avg_word_len = np.mean([len(w) for w in words])
+    sentence_count = max(1, len(re.split(r"[.!?؟]+", text)))
+    diversity = len(set(words)) / max(1, len(words))
+    score = 0.4 * diversity + 0.3 * (avg_word_len / 6.0) + 0.3 * (min(sentence_count, 6) / 6.0)
+    return float(np.clip(score, 0.0, 1.0))
+
+def rhyme_score_ar(text: str) -> float:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 2:
+        return 0.0
+    endings = []
+    for l in lines:
+        l2 = re.sub(r"[^\u0600-\u06FFa-zA-Z0-9\s]", "", l)
+        words = l2.split()
+        if not words:
+            continue
+        tail = words[-1][-2:] if len(words[-1]) >= 2 else words[-1]
+        endings.append(tail)
+    if len(endings) < 2:
+        return 0.0
+    most = max([endings.count(e) for e in set(endings)])
+    return float(most / max(1, len(endings)))
+
+def style_adherence(text: str) -> float:
+    indicators = 0
+    indicators += 1 if re.search(r"\bمثل\b|\bكأن\b", text) else 0
+    indicators += 1 if re.search(r"[،؛:—\-]", text) else 0
+    indicators += 1 if len(set(re.findall(r"[aeiou]", text))) > 2 else 0
+    indicators += 1 if re.search(r"[اأإءوىي]", text) else 0
+    return float(np.clip(indicators / 4.0, 0.0, 1.0))
+
+def load_corpus(path: str) -> List[str]:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    else:
+        raw = """
+أحبكِ حتى تفيض المواسمُ بالشهدِ
+وتنحني الريحُ نحو الجداولِ ترتّلُ اسمكِ
+
+I linger where moonlight weaves silver threads,
+As quiet seas hum ancient hymns.
+        """
+    poems = split_poems(raw)
+    return poems
+
+def prepare_data(poems: List[str], char_level=True, max_seq_len=256, test_size=0.1, val_size=0.1):
+    train_poems, tmp_poems = train_test_split(poems, test_size=(test_size + val_size), random_state=cfg.seed)
+    val_poems, test_poems = train_test_split(tmp_poems, test_size=(test_size / (test_size + val_size)), random_state=cfg.seed)
+    vocab = build_vocab(train_poems, char_level=char_level, min_word_freq=cfg.min_word_freq)
+    train_seq = [poem_to_sequence(p, vocab, char_level) for p in train_poems]
+    val_seq = [poem_to_sequence(p, vocab, char_level) for p in val_poems]
+    test_seq = [poem_to_sequence(p, vocab, char_level) for p in test_poems]
+    train_ds = PoetryDataset(train_seq, max_seq_len)
+    val_ds = PoetryDataset(val_seq, max_seq_len)
+    test_ds = PoetryDataset(test_seq, max_seq_len)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch, num_workers=cfg.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch, num_workers=cfg.num_workers)
+    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch, num_workers=cfg.num_workers)
+    return vocab, train_dl, val_dl, test_dl
+
+def train_model_lstm(vocab, train_dl, val_dl, device="cpu"):
+    model = LSTMGenerator(len(vocab), cfg.lstm_embed_dim, cfg.lstm_hidden_dim, cfg.lstm_layers, cfg.lstm_dropout).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    best_val = float("inf")
+    for epoch in range(1, cfg.epochs + 1):
+        train_loss = train_one_epoch(model, train_dl, opt, pad_idx=0, grad_clip=cfg.grad_clip, device=device)
+        val_loss, val_ppl = evaluate(model, val_dl, pad_idx=0, device=device)
+        print(f"[LSTM] Epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_ppl={val_ppl:.2f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({"model_state": model.state_dict(), "vocab": vocab.itos}, os.path.join(cfg.out_dir, cfg.lstm_ckpt))
+    return model
+
+def generate_square_subsequent_mask(sz: int):
+    mask = torch.triu(torch.ones(sz, sz), diagonal=1).bool()
+    return mask
+
+def train_model_transformer(vocab, train_dl, val_dl, device="cpu"):
+    model = TransformerGenerator(len(vocab), cfg.tf_embed_dim, cfg.tf_ff_dim, cfg.tf_heads, cfg.tf_layers, cfg.tf_dropout).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    best_val = float("inf")
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for x, y in tqdm(train_dl, desc="Train-TF", leave=False):
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            T = x.size(1)
+            src_mask = generate_square_subsequent_mask(T).to(device)
+            logits = model(x, src_mask=src_mask)
+            loss = compute_loss(logits, y, pad_idx=0)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            opt.step()
+            total_loss += loss.item()
+        train_loss = total_loss / len(train_dl)
+        model.eval()
+        val_total = 0.0
+        with torch.no_grad():
+            for x, y in tqdm(val_dl, desc="Val-TF", leave=False):
+                x, y = x.to(device), y.to(device)
+                T = x.size(1)
+                src_mask = generate_square_subsequent_mask(T).to(device)
+                logits = model(x, src_mask=src_mask)
+                loss = compute_loss(logits, y, pad_idx=0)
+                val_total += loss.item()
+        val_loss = val_total / len(val_dl)
+        val_ppl = math.exp(val_loss)
+        print(f"[Transformer] Epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_ppl={val_ppl:.2f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save({"model_state": model.state_dict(), "vocab": vocab.itos}, os.path.join(cfg.out_dir, cfg.tf_ckpt))
+    return model
+
+def evaluate_generated_texts(model, vocab, prompts: List[str], device="cpu", char_level=True):
+    results = []
+    for p in prompts:
+        gen = generate_text(model, vocab, prompt=p, max_len=cfg.gen_max_len, temperature=cfg.temperature, top_k=cfg.top_k, device=device, char_level=char_level)
+        coh = coherence_score(gen)
+        rhy = rhyme_score_ar(gen)
+        sty = style_adherence(gen)
+        results.append({"prompt": p, "generated": gen, "coherence": coh, "rhyme": rhy, "style": sty})
+    return results
+
+def print_evaluation_table(results: List[Dict], title="Evaluation"):
+    print("\n" + "="*80)
+    print(title)
+    print("="*80)
+    for i, r in enumerate(results, 1):
+        print(f"Sample {i}:")
+        print(f"Prompt: {r['prompt']}")
+        print("Generated:\n" + r['generated'])
+        print(f"Coherence: {r['coherence']:.3f} | Rhyme(ar): {r['rhyme']:.3f} | Style: {r['style']:.3f}")
+        print("-"*80)
+
+def main():
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    poems = load_corpus(cfg.data_path)
+    vocab, train_dl, val_dl, test_dl = prepare_data(poems, char_level=cfg.use_char_level, max_seq_len=cfg.max_seq_len, test_size=cfg.test_size, val_size=cfg.val_size)
+    print(f"Vocab size: {len(vocab)}")
+    print("\nTraining LSTM model...")
+    lstm_model = train_model_lstm(vocab, train_dl, val_dl, device=cfg.device)
+    lstm_val_loss, lstm_val_ppl = evaluate(lstm_model, val_dl, device=cfg.device)
+    print(f"LSTM Final Val: loss={lstm_val_loss:.4f}, ppl={lstm_val_ppl:.2f}")
+    print("\nTraining Transformer model...")
+    tf_model = train_model_transformer(vocab, train_dl, val_dl, device=cfg.device)
+    tf_val_loss, tf_val_ppl = evaluate(tf_model, val_dl, device=cfg.device)
+    print(f"Transformer Final Val: loss={tf_val_loss:.4f}, ppl={tf_val_ppl:.2f}")
+    prompts = ["أحبكِ يا دفء القصيد", "Under moonlit waves, I breathe", "يا ليلُ طوّل ما تشاء"]
+    print("\nGenerating with LSTM...")
+    lstm_results = evaluate_generated_texts(lstm_model, vocab, prompts, device=cfg.device, char_level=cfg.use_char_level)
+    print_evaluation_table(lstm_results, title="LSTM Evaluation")
+    print("\nGenerating with Transformer...")
+    tf_results = evaluate_generated_texts(tf_model, vocab, prompts, device=cfg.device, char_level=cfg.use_char_level)
+    print_evaluation_table(tf_results, title="Transformer Evaluation")
+    def aggregate_scores(results):
+        coh = np.mean([r["coherence"] for r in results])
+        rhy = np.mean([r["rhyme"] for r in results])
+        sty = np.mean([r["style"] for r in results])
+        return {"coherence": float(coh), "rhyme": float(rhy), "style": float(sty)}
+    ag_lstm = aggregate_scores(lstm_results)
+    ag_tf = aggregate_scores(tf_results)
+    print("\n" + "="*80)
+    print("Model Comparison (Aggregated)")
+    print("="*80)
+    print(f"LSTM -> Coherence: {ag_lstm['coherence']:.3f}, Rhyme: {ag_lstm['rhyme']:.3f}, Style: {ag_lstm['style']:.3f}, Val PPL: {lstm_val_ppl:.2f}")
+    print(f"TF   -> Coherence: {ag_tf['coherence']:.3f}, Rhyme: {ag_tf['rhyme']:.3f}, Style: {ag_tf['style']:.3f}, Val PPL: {tf_val_ppl:.2f}")
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
